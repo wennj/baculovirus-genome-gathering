@@ -1,0 +1,7 @@
+"field"	"source"	"meaning"
+"ncbi_create_date"	"NCBI ESummary (nuccore), Feld createdate"	"Anlage des Records in der NCBI-Datenbank"
+"ncbi_update_date"	"NCBI ESummary (nuccore), Feld updatedate"	"letzte Änderung des Records bei NCBI"
+"genbank_locus_date"	"GenBank-Flatfile, Datum am Ende der LOCUS-Zeile"	"Datum der letzten Änderung des Flatfiles; für die Testrecords identisch mit ncbi_update_date"
+"first_submission_date"	"GenBank-Flatfile, frühestes REFERENCE/JOURNAL 'Submitted (DD-MMM-YYYY)'"	"Datum der Direkteinreichung an INSDC laut Record"
+"collection_date"	"GenBank-Flatfile, Qualifier /collection_date im source-Feature"	"biologisches Sammeldatum der Probe"
+"public_release_date"	"nicht reproduzierbar aus NCBI verfügbar"	"immer NA; NCBI exponiert kein separates Freigabedatum. ncbi_create_date ist der naheliegendste Proxy, wird aber nicht stillschweigend damit gleichgesetzt"

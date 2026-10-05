@@ -48,3 +48,34 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+#reference files
+sequence_gathering.qmd
+genome_metadata.tsv
+.posit/assistant
+
+# Große, reproduzierbare NCBI-Rohdownloads: nicht auf GitHub.
+# Sie lassen sich jederzeit aus der Metadatentabelle erneut beschaffen.
+genomes/fasta/
+genomes/genbank/
+genomes/gff3/
+
+# Lauf-Artefakte (Logs, Cache) sind nicht Teil des Projektstands.
+data/cache/
+data/logs/
+
+# data/metadata/ wird BEWUSST versioniert, damit nachvollziehbar bleibt,
+# welche NCBI-Records die Grundlage eines Projektstands waren:
+#   data/metadata/baculovirus_genome_metadata.tsv
+#   data/metadata/ncbi_query_metadata.json
+#   data/metadata/date_field_sources.tsv
+#   data/metadata/metadata_field_classification.tsv
+# Es darf hier daher keine data/metadata-Ignore-Regel geben.
+
+# macOS
+.DS_Store
+
+# Quarto render output (regenerate with: quarto render baculovirus-genome-gathering.qmd)
+/.quarto/
+/baculovirus-genome-gathering.html
+/baculovirus-genome-gathering_files/

@@ -1,0 +1,1235 @@
+---
+title: "Baculovirus genome gathering"
+format: html
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+Dieser Workflow verwendet ausschließlich offizielle NCBI-Schnittstellen. Die Suchabfrage wird nicht biologisch nachbearbeitet. Insbesondere werden keine ICTV-Species abgeleitet.
+
+## Konfiguration
+
+```{r}
+library(rentrez)
+library(jsonlite)
+library(XML)
+
+options(stringsAsFactors = FALSE)
+
+# Unter einer C-Locale maskiert R Nicht-ASCII-Zeichen beim Schreiben als
+# <U+00FC>. Das betrifft NCBI-Werte wie /geo_loc_name oder Organismusnamen und
+# würde die Metadatentabelle verfälschen. Daher wird eine UTF-8-Locale gesetzt,
+# falls die Session keine verwendet.
+if (!isTRUE(l10n_info()$`UTF-8`)) {
+  for (loc in c("en_US.UTF-8", "C.UTF-8", "de_DE.UTF-8", "UTF-8")) {
+    if (nzchar(suppressWarnings(Sys.setlocale("LC_CTYPE", loc)))) break
+  }
+  if (!isTRUE(l10n_info()$`UTF-8`)) {
+    warning("Keine UTF-8-Locale verfuegbar; Nicht-ASCII-Zeichen aus NCBI werden maskiert geschrieben.")
+  }
+}
+
+root <- normalizePath(".", mustWork = TRUE)
+paths <- list(
+  fasta = file.path(root, "genomes", "fasta"),
+  genbank = file.path(root, "genomes", "genbank"),
+  gff3 = file.path(root, "genomes", "gff3"),
+  metadata = file.path(root, "data", "metadata"),
+  logs = file.path(root, "data", "logs"),
+  cache = file.path(root, "data", "cache")
+)
+invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+# .Renviron wird von R beim Start im Projektverzeichnis gelesen. Falls der
+# Workflow aus einer Session ohne geladenes .Renviron gerendert wird, wird die
+# Datei hier nachgeladen. Der Key wird dabei zu keinem Zeitpunkt ausgegeben.
+if (!nzchar(Sys.getenv("ENTREZ_KEY")) && file.exists(file.path(root, ".Renviron"))) {
+  readRenviron(file.path(root, ".Renviron"))
+}
+
+entrez_key_available <- nzchar(Sys.getenv("ENTREZ_KEY"))
+if (!entrez_key_available) {
+  stop("ENTREZ_KEY ist nicht gesetzt. Trage den Key lokal in .Renviron ein und rendere danach erneut.")
+}
+entrez_key_available
+```
+
+Die obige Ausgabe ist absichtlich nur ein technischer Verfügbarkeitstest (`TRUE`/`FALSE`); der Key selbst wird nicht protokolliert. `rentrez` liest `ENTREZ_KEY` selbstständig aus der Umgebung. Die EUtils-Rate wird mit API-Key auf höchstens etwa 9 Requests pro Sekunde begrenzt.
+
+### Hilfsfunktionen für Wiederholungen und Werte
+
+`with_retry()` wertet den übergebenen Ausdruck bei jedem Versuch neu aus. Eine frühere Variante hat denselben Promise mehrfach erzwungen; R meldet das als `restarting interrupted promise evaluation` und ein Ausdruck, der regulär `NULL` liefert, wurde fälschlich als Fehler behandelt. Beides ist hier behoben.
+
+```{r}
+rate_sleep <- 0.12
+retry_delays <- c(1, 3, 8, 20)
+
+with_retry <- function(expr, label = "NCBI request") {
+  call_expr <- substitute(expr)
+  env <- parent.frame()
+  delays <- c(0, retry_delays)
+  last_error <- NULL
+  for (i in seq_along(delays)) {
+    if (delays[i] > 0) Sys.sleep(delays[i])
+    Sys.sleep(rate_sleep)
+    attempt <- tryCatch(
+      list(ok = TRUE, value = eval(call_expr, env)),
+      error = function(e) list(ok = FALSE, error = e)
+    )
+    if (isTRUE(attempt$ok)) return(attempt$value)
+    last_error <- attempt$error
+  }
+  stop(sprintf("%s: nach %d Versuchen fehlgeschlagen: %s",
+               label, length(delays), conditionMessage(last_error)), call. = FALSE)
+}
+
+# Robuster Einzelwert aus ESummary-Feldern, die fehlen, NULL, leere Liste,
+# Länge 0, Skalar oder Vektor sein können.
+scalar <- function(x, default = NA_character_) {
+  if (is.null(x) || length(x) == 0L) return(default)
+  v <- x[[1L]]
+  if (!is.atomic(v)) v <- unlist(v, use.names = FALSE)
+  if (is.null(v) || length(v) == 0L) return(default)
+  v <- v[[1L]]
+  if (is.na(v)) return(default)
+  v <- as.character(v)
+  if (!nzchar(trimws(v))) default else v
+}
+
+int_scalar <- function(x, default = NA_integer_) {
+  v <- scalar(x, NA_character_)
+  if (is.na(v)) return(default)
+  suppressWarnings(as.integer(v))
+}
+
+base_accession <- function(accver) sub("\\.[0-9]+$", "", accver)
+
+# GenBank-Datumsangaben (02-SEP-1997) sind englisch. as.Date(format = "%d-%b-%Y")
+# ist locale-abhängig und schlägt z. B. unter deutscher Locale fehl; daher eine
+# explizite Monatstabelle.
+GB_MONTHS <- c(JAN = 1L, FEB = 2L, MAR = 3L, APR = 4L, MAY = 5L, JUN = 6L,
+               JUL = 7L, AUG = 8L, SEP = 9L, OCT = 10L, NOV = 11L, DEC = 12L)
+
+gb_date_to_iso <- function(x) {
+  if (length(x) != 1L || is.na(x) || !nzchar(x)) return(NA_character_)
+  p <- strsplit(trimws(x), "-", fixed = TRUE)[[1L]]
+  if (length(p) != 3L) return(NA_character_)
+  m <- GB_MONTHS[[toupper(p[2L])]]
+  if (is.null(m) || is.na(m)) return(NA_character_)
+  d <- suppressWarnings(as.integer(p[1L]))
+  if (is.na(d)) return(NA_character_)
+  sprintf("%s-%02d-%02d", p[3L], m, d)
+}
+
+# ESummary liefert Datumsangaben als 1998/11/03.
+esummary_date_to_iso <- function(x) {
+  v <- scalar(x)
+  if (is.na(v)) return(NA_character_)
+  v <- gsub("/", "-", v, fixed = TRUE)
+  if (grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}", v)) substr(v, 1L, 10L) else NA_character_
+}
+
+# Schreibt eine Tabelle nur, wenn sich ihr Inhalt gegenüber der vorhandenen
+# Datei unterscheidet. Ein Lauf ohne fachliche Änderung erzeugt damit keinen
+# Diff in der Versionskontrolle und fasst bestehende Outputs nicht an.
+write_tsv_if_changed <- function(df, file) {
+  tmp <- tempfile(fileext = ".tsv")
+  on.exit(unlink(tmp), add = TRUE)
+  write.table(df, tmp, sep = "\t", quote = TRUE, row.names = FALSE, na = "NA")
+  new_lines <- readLines(tmp, warn = FALSE)
+  old_lines <- if (file.exists(file)) readLines(file, warn = FALSE) else character(0)
+  if (identical(new_lines, old_lines)) return("unveraendert")
+  if (!file.copy(tmp, file, overwrite = TRUE)) {
+    stop("Datei konnte nicht geschrieben werden: ", file)
+  }
+  "geschrieben"
+}
+
+write_atomic <- function(text, file) {
+  tmp <- paste0(file, ".partial")
+  writeLines(text, tmp, useBytes = TRUE)
+  if (!file.rename(tmp, file)) {
+    unlink(tmp)
+    stop("Konnte Datei nicht atomar speichern: ", file)
+  }
+  invisible(file)
+}
+```
+
+## Laufmodus
+
+Der Workflow ist inkrementell. Jeder Lauf führt die vollständige NCBI-Suche aus, vergleicht das Ergebnis mit der vorhandenen Metadatentabelle und verarbeitet nur Records, die neu sind, deren `accession_version` sich geändert hat oder deren Daten nachweislich fehlen. Unveränderte Records werden unverändert aus der bestehenden Tabelle übernommen; für sie erfolgt keine ESummary-, Taxonomy-, ELink- oder EFetch-Abfrage und keine erneute Inhaltsprüfung der lokalen Dateien.
+
+`test_accessions` beschränkt ausschließlich, welche Records *verarbeitet* werden. Die Bestandsaufnahme läuft immer über das vollständige Suchergebnis, damit unveränderte Records nicht versehentlich als entfallen gelten.
+
+```{r}
+test_accessions <- character(0)
+
+env_override <- Sys.getenv("BACULOVIRUS_TEST_ACCESSIONS", unset = NA_character_)
+if (!is.na(env_override)) {
+  parsed <- trimws(strsplit(env_override, ",", fixed = TRUE)[[1L]])
+  test_accessions <- parsed[nzchar(parsed)]
+}
+restrict_processing <- length(test_accessions) > 0L
+
+# Records, für die NCBI nachweislich kein GFF3 bereitstellt, werden nicht bei
+# jedem Lauf erneut angefragt. TRUE erzwingt eine erneute Prüfung.
+recheck_unavailable_gff3 <- FALSE
+
+# Erzwingt die vollständige Neuverarbeitung aller Records und ignoriert den
+# vorhandenen Bestand. Nur für einen bewussten Komplettneuaufbau.
+force_reprocess_all <- FALSE
+
+data.frame(
+  mode = if (restrict_processing) "Verarbeitung auf test_accessions beschraenkt" else "Inkrementeller Lauf",
+  recheck_unavailable_gff3 = recheck_unavailable_gff3,
+  force_reprocess_all = force_reprocess_all
+)
+```
+
+## NCBI-Suche und Bestandsaufnahme
+
+Die Abfrage `Baculoviridae[Organism] AND complete genome[Title]` bleibt unverändert. ESearch liefert Trefferzahl und History. Die aktuellen `accession.version`-Werte werden anschließend über EFetch mit `rettype="acc"` abgerufen: das sind für rund 630 Records etwa 7 kB in zwei Batches. Ein vollständiger ESummary-Abruf über alle Treffer wäre um ein Vielfaches teurer und wird deshalb erst für die tatsächlich zu verarbeitenden Records ausgeführt.
+
+```{r}
+query <- "Baculoviridae[Organism] AND complete genome[Title]"
+search_time <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+
+search <- with_retry(
+  rentrez::entrez_search(db = "nuccore", term = query, use_history = TRUE, retmax = 0),
+  "ESearch"
+)
+search_count <- search$count
+
+acc_batch <- 500L
+acc_starts <- if (search_count == 0L) integer() else seq.int(0L, search_count - 1L, by = acc_batch)
+current_accver <- unlist(lapply(acc_starts, function(st) {
+  txt <- with_retry(
+    rentrez::entrez_fetch(db = "nuccore", web_history = search$web_history,
+                          rettype = "acc", retmode = "text",
+                          retstart = st, retmax = min(acc_batch, search_count - st)),
+    paste0("EFetch acc ab ", st)
+  )
+  v <- trimws(strsplit(txt, "\n", fixed = TRUE)[[1L]])
+  v[nzchar(v)]
+}), use.names = FALSE)
+
+if (length(current_accver) != search_count) {
+  stop(sprintf("Inventar unvollstaendig: %d Accessions fuer %d Treffer erhalten.",
+               length(current_accver), search_count))
+}
+if (!all(grepl("\\.[0-9]+$", current_accver))) {
+  stop("Inventar enthaelt Eintraege ohne Versionsnummer.")
+}
+if (anyDuplicated(current_accver)) {
+  warning(sprintf("%d doppelte accession.version im Suchergebnis; Duplikate werden zusammengefasst.",
+                  sum(duplicated(current_accver))))
+  current_accver <- unique(current_accver)
+}
+current_accession <- base_accession(current_accver)
+duplicate_accessions <- unique(current_accession[duplicated(current_accession)])
+if (length(duplicate_accessions)) {
+  warning("Mehrere Versionen derselben Accession im Suchergebnis: ",
+          paste(duplicate_accessions, collapse = ", "))
+}
+
+data.frame(
+  search_hits = search_count,
+  inventory_accession_versions = length(current_accver),
+  duplicate_accessions = length(duplicate_accessions),
+  retrieved_at_utc = search_time
+)
+```
+
+## Abgleich mit dem vorhandenen Bestand
+
+Die vorhandene Metadatentabelle wird mit einem festen Spaltenschema eingelesen, damit vorhandene Zeilen unverändert übernommen und zeichengleich zurückgeschrieben werden können. Weicht das Schema ab, wird der Bestand verworfen und alles neu verarbeitet.
+
+Ein Record gilt als vollständig, wenn die Pflichtfelder gesetzt sind, die berechnete Länge mit NCBI übereinstimmt und die erwarteten lokalen Dateien existieren. Geprüft wird dabei nur die Existenz der Dateien, nicht ihr Inhalt; die Inhaltsprüfung erfolgt ausschließlich beim tatsächlichen Download. Fehlt ein GFF3, weil NCBI für diesen Record keines bereitstellt (`gff3_status = "not_available"`), gilt das nicht als Lücke.
+
+```{r}
+metadata_file <- file.path(paths$metadata, "baculovirus_genome_metadata.tsv")
+
+METADATA_SCHEMA <- c(
+  accession = "character", accession_version = "character", secondary_accessions = "character",
+  organism = "character", ncbi_taxid = "character", ncbi_taxon_name = "character",
+  ncbi_taxon_rank = "character", ncbi_species = "character", ncbi_species_taxid = "character",
+  genus = "character", family = "character", full_taxonomy = "character",
+  definition = "character", sourcedb = "character", sequence_status = "character",
+  molecule_type = "character", topology = "character",
+  genome_length_bp = "integer", ncbi_slen = "integer", length_matches_ncbi = "logical",
+  gc_content_pct = "numeric", n_ambiguous_bases = "integer", ambiguous_base_codes = "character",
+  host = "character", strain = "character", isolate = "character", geo_loc_name = "character",
+  collection_date = "character", ncbi_create_date = "character", ncbi_update_date = "character",
+  genbank_locus_date = "character", first_submission_date = "character",
+  public_release_date = "character", refseq_relation = "character",
+  refseq_relation_source = "character", gff3_status = "character"
+)
+
+read_existing_metadata <- function(file) {
+  if (!file.exists(file)) return(NULL)
+  df <- read.delim(file, sep = "\t", quote = "\"", na.strings = "NA",
+                   colClasses = "character", check.names = FALSE)
+  if (!identical(colnames(df), names(METADATA_SCHEMA))) {
+    warning("Spaltenschema der vorhandenen Metadatentabelle weicht ab; alle Records werden neu verarbeitet.")
+    return(NULL)
+  }
+  for (cn in names(METADATA_SCHEMA)) {
+    df[[cn]] <- switch(METADATA_SCHEMA[[cn]],
+      integer = suppressWarnings(as.integer(df[[cn]])),
+      numeric = suppressWarnings(as.numeric(df[[cn]])),
+      logical = as.logical(df[[cn]]),
+      df[[cn]])
+  }
+  if (anyDuplicated(df$accession)) {
+    stop("Vorhandene Metadatentabelle enthaelt doppelte Accessions: ",
+         paste(unique(df$accession[duplicated(df$accession)]), collapse = ", "))
+  }
+  df
+}
+
+existing <- if (force_reprocess_all) NULL else read_existing_metadata(metadata_file)
+
+# Vollständigkeit vorhandener Zeilen, vektorisiert und ohne Netzwerkzugriff.
+rows_complete <- function(df) {
+  ok <- !is.na(df$accession_version) & !is.na(df$ncbi_taxid) & !is.na(df$full_taxonomy) &
+        !is.na(df$genome_length_bp) & !is.na(df$ncbi_slen) & df$length_matches_ncbi %in% TRUE
+  ok <- ok & file.exists(file.path(paths$fasta, paste0(df$accession, ".fasta")))
+  ok <- ok & file.exists(file.path(paths$genbank, paste0(df$accession, ".gbff")))
+  gff_exists <- file.exists(file.path(paths$gff3, paste0(df$accession, ".gff3")))
+  st <- df$gff3_status
+  gff_ok <- rep(FALSE, nrow(df))
+  gff_ok[st %in% c("ok_downloaded", "ok_cached")] <- gff_exists[st %in% c("ok_downloaded", "ok_cached")]
+  gff_ok[st %in% "not_available"] <- !recheck_unavailable_gff3
+  ok & gff_ok
+}
+
+classify_against_existing <- function(existing, current_accver) {
+  current_accession <- base_accession(current_accver)
+  if (is.null(existing) || !nrow(existing)) {
+    return(list(unchanged = character(0), new = current_accver,
+                updated = character(0), incomplete = character(0),
+                retired = character(0)))
+  }
+  known <- current_accession %in% existing$accession
+  idx <- match(current_accession[known], existing$accession)
+  cur_known <- current_accver[known]
+  changed <- cur_known != existing$accession_version[idx]
+
+  same_rows <- existing[idx[!changed], , drop = FALSE]
+  complete <- rows_complete(same_rows)
+
+  list(
+    unchanged = same_rows$accession_version[complete],
+    new = current_accver[!known],
+    updated = cur_known[changed],
+    incomplete = same_rows$accession_version[!complete],
+    retired = existing$accession_version[!(existing$accession %in% current_accession)]
+  )
+}
+
+cls <- classify_against_existing(existing, current_accver)
+
+run_accessions <- unique(c(cls$new, cls$updated, cls$incomplete))
+if (restrict_processing) {
+  # Gezielte Neuverarbeitung: genau die genannten Accessions, unabhängig von
+  # ihrem Status. Alle übrigen Records werden unverändert übernommen.
+  unknown <- setdiff(test_accessions, current_accver)
+  if (length(unknown)) {
+    stop("Nicht im aktuellen NCBI-Suchergebnis: ", paste(unknown, collapse = ", "))
+  }
+  run_accessions <- intersect(current_accver, test_accessions)
+}
+
+# run_accessions muss eindeutig sein und vollständig aus dem aktuellen
+# Suchergebnis stammen. Die Trennung "übernommen vs. neu verarbeitet" erfolgt
+# später über processed_accessions und ist damit überschneidungsfrei.
+stopifnot(!anyDuplicated(run_accessions), all(run_accessions %in% current_accver))
+
+if (length(cls$retired)) {
+  write.table(
+    data.frame(accession_version = cls$retired,
+               note = "nicht mehr im aktuellen NCBI-Suchergebnis",
+               checked_at_utc = search_time),
+    file.path(paths$logs, "records_not_in_current_search.tsv"),
+    sep = "\t", quote = TRUE, row.names = FALSE
+  )
+}
+
+resume_summary <- data.frame(
+  ncbi_records_found = search_count,
+  unchanged = length(cls$unchanged),
+  new_accessions = length(cls$new),
+  changed_accession_version = length(cls$updated),
+  incomplete_reprocess = length(cls$incomplete),
+  not_in_current_search = length(cls$retired),
+  to_process = length(run_accessions)
+)
+resume_summary
+```
+
+Records, die nicht mehr im aktuellen Suchergebnis erscheinen, werden nicht gelöscht. Sie bleiben in der Metadatentabelle, werden gezählt und in `data/logs/records_not_in_current_search.tsv` aufgeführt, damit zurückgezogene oder umklassifizierte NCBI-Records sichtbar bleiben.
+
+## ESummary für die zu verarbeitenden Records
+
+```{r}
+# entrez_summary() liefert für eine einzelne UID ein esummary-Objekt und für
+# mehrere UIDs eine esummary_list.
+as_summary_list <- function(x) {
+  if (inherits(x, "esummary")) return(list(x))
+  if (inherits(x, "esummary_list")) return(unclass(x))
+  if (is.list(x)) return(x)
+  list(x)
+}
+
+batch_size <- 200L
+
+if (length(run_accessions)) {
+  resolve_uid <- function(accver) {
+    hit <- with_retry(
+      rentrez::entrez_search(db = "nuccore", term = paste0(accver, "[Accession]"), retmax = 2),
+      paste0("ESearch ", accver)
+    )
+    if (length(hit$ids) != 1L) {
+      stop(sprintf("Accession %s liefert %d Treffer statt genau einem.", accver, length(hit$ids)))
+    }
+    hit$ids[[1L]]
+  }
+  run_uids <- vapply(run_accessions, resolve_uid, character(1))
+  sum_starts <- seq.int(0L, length(run_uids) - 1L, by = batch_size)
+  summaries <- do.call(c, lapply(sum_starts, function(st) {
+    ids <- run_uids[(st + 1L):min(st + batch_size, length(run_uids))]
+    as_summary_list(with_retry(
+      rentrez::entrez_summary(db = "nuccore", id = unname(ids)),
+      paste0("ESummary ab ", st)
+    ))
+  }))
+
+  # Zuordnung Summary <-> Accession ausschließlich über Namen, nie über Position.
+  accession_version <- vapply(summaries, function(x) scalar(x$accessionversion), character(1))
+  usable <- !is.na(accession_version) & nzchar(accession_version)
+  if (any(!usable)) {
+    warning(sprintf("%d ESummary-Objekt(e) ohne accessionversion werden nicht verarbeitet.", sum(!usable)))
+  }
+  summaries <- summaries[usable]
+  names(summaries) <- accession_version[usable]
+
+  missing_summary <- setdiff(run_accessions, names(summaries))
+  if (length(missing_summary)) {
+    stop("Kein ESummary erhalten fuer: ", paste(missing_summary, collapse = ", "))
+  }
+} else {
+  summaries <- list()
+}
+
+data.frame(to_process = length(run_accessions), summaries_retrieved = length(summaries))
+```
+
+## Validierung und Downloads
+
+Für jeden Record werden FASTA, GenBank-Flatfile und natives NCBI-GFF3 abgelegt. Bereits vorhandene Dateien werden nicht allein wegen ihrer Existenz als Erfolg gewertet, sondern inhaltlich geprüft; ungültige Dateien werden verworfen und erneut geladen. EFetch kann Fehlertexte mit HTTP-Status 200 ausliefern, daher ist die Inhaltsprüfung zwingend. Dateinamen verwenden die Accession ohne Version, die Version bleibt in den Metadaten erhalten.
+
+```{r}
+failed_file <- file.path(paths$logs, "failed_downloads.tsv")
+failure_cols <- c("accession", "accession_version", "step", "error_type", "error", "timestamp_utc")
+if (!file.exists(failed_file)) {
+  write.table(setNames(data.frame(matrix(character(), nrow = 0, ncol = length(failure_cols))), failure_cols),
+              failed_file, sep = "\t", quote = TRUE, row.names = FALSE)
+}
+
+log_failure <- function(acc, accver, step, error_type, error) {
+  row <- data.frame(
+    accession = acc, accession_version = accver, step = step,
+    error_type = error_type,
+    error = gsub("[\r\n\t]+", " ", as.character(error)),
+    timestamp_utc = format(Sys.time(), tz = "UTC", usetz = TRUE)
+  )
+  write.table(row, failed_file, sep = "\t", quote = TRUE, row.names = FALSE,
+              col.names = FALSE, append = TRUE)
+  invisible(row)
+}
+
+validate_fasta <- function(file, accver, expected_length = NA_integer_) {
+  lines <- readLines(file, warn = FALSE)
+  if (!length(lines)) return("empty")
+  if (!startsWith(lines[1L], ">")) return("not_fasta")
+  if (!grepl(accver, lines[1L], fixed = TRUE)) return("accession_mismatch")
+  seq <- paste(lines[-1L][!startsWith(lines[-1L], ">")], collapse = "")
+  seq <- gsub("[[:space:]]", "", seq)
+  if (!nchar(seq)) return("no_sequence")
+  if (grepl("[^ACGTURYSWKMBDHVNacgturyswkmbdhvn]", seq)) return("non_nucleotide_characters")
+  # Ein abgebrochener Download bleibt syntaktisch gültiges FASTA. Nur der
+  # Vergleich mit der von NCBI gemeldeten Sequenzlänge erkennt ihn.
+  if (!is.na(expected_length) && nchar(seq) != expected_length) return("length_mismatch")
+  "ok"
+}
+
+validate_genbank <- function(file, accver, expected_length = NA_integer_) {
+  lines <- readLines(file, warn = FALSE)
+  if (!length(lines)) return("empty")
+  if (!startsWith(lines[1L], "LOCUS")) return("not_genbank")
+  acc_line <- grep("^ACCESSION", lines, value = TRUE)
+  if (!length(acc_line)) return("missing_accession")
+  acc_primary <- strsplit(trimws(sub("^ACCESSION", "", acc_line[1L])), " +")[[1L]][1L]
+  if (!identical(acc_primary, base_accession(accver))) return("accession_mismatch")
+  ver_line <- grep("^VERSION", lines, value = TRUE)
+  if (!length(ver_line)) return("missing_version")
+  ver <- strsplit(trimws(sub("^VERSION", "", ver_line[1L])), " +")[[1L]][1L]
+  if (!identical(ver, accver)) return("version_mismatch")
+  if (!any(startsWith(lines, "FEATURES"))) return("missing_features")
+  if (!any(startsWith(lines, "ORIGIN"))) return("missing_origin")
+  # Ein vollständiges GenBank-Flatfile endet mit dem Terminator "//".
+  non_empty <- lines[nzchar(trimws(lines))]
+  if (!length(non_empty) || !identical(trimws(non_empty[length(non_empty)]), "//")) {
+    return("truncated_record")
+  }
+  if (!is.na(expected_length)) {
+    locus_tokens <- strsplit(trimws(sub("^LOCUS", "", lines[1L])), " +")[[1L]]
+    locus_len <- if (length(locus_tokens) >= 2L) suppressWarnings(as.integer(locus_tokens[2L])) else NA_integer_
+    if (!is.na(locus_len) && locus_len != expected_length) return("length_mismatch")
+  }
+  "ok"
+}
+
+# Unterscheidet echtes NCBI-GFF3, eine von NCBI gelieferte Annotation ohne
+# Features ("not available") und ungültige Antworten.
+classify_gff3_text <- function(text, accver, expected_length = NA_integer_) {
+  if (!grepl("^##gff-version", text)) return("invalid_response")
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1L]]
+  region_line <- grep("^##sequence-region", lines, value = TRUE)
+  if (length(region_line)) {
+    tok <- strsplit(trimws(region_line[1L]), " +")[[1L]]
+    if (length(tok) >= 4L) {
+      if (!identical(tok[2L], accver)) return("accession_mismatch")
+      reg_len <- suppressWarnings(as.integer(tok[4L]))
+      if (!is.na(expected_length) && !is.na(reg_len) && reg_len != expected_length) {
+        return("length_mismatch")
+      }
+    }
+  }
+  feat <- lines[!startsWith(lines, "#") & nzchar(trimws(lines))]
+  if (!length(feat)) return("no_annotation")
+  parts <- strsplit(feat, "\t", fixed = TRUE)
+  if (!all(vapply(parts, length, integer(1)) >= 9L)) return("invalid_response")
+  seqids <- unique(vapply(parts, function(x) x[[1L]], character(1)))
+  if (!all(seqids == accver)) return("accession_mismatch")
+  types <- vapply(parts, function(x) x[[3L]], character(1))
+  if (sum(types != "region") == 0L) return("no_annotation")
+  "ok"
+}
+
+validate_gff3 <- function(file, accver, expected_length = NA_integer_) {
+  classify_gff3_text(paste(readLines(file, warn = FALSE), collapse = "\n"),
+                     accver, expected_length)
+}
+
+file_spec <- list(
+  fasta   = list(rettype = "fasta", ext = ".fasta", dir = "fasta",   validate = validate_fasta),
+  genbank = list(rettype = "gb",    ext = ".gbff",  dir = "genbank", validate = validate_genbank),
+  gff3    = list(rettype = "gff3",  ext = ".gff3",  dir = "gff3",    validate = validate_gff3)
+)
+
+acquire_file <- function(accver, kind, expected_length = NA_integer_) {
+  spec <- file_spec[[kind]]
+  acc <- base_accession(accver)
+  file <- file.path(paths[[spec$dir]], paste0(acc, spec$ext))
+
+  if (file.exists(file)) {
+    size <- file.info(file)$size
+    state <- if (is.na(size) || size <= 0) "empty" else spec$validate(file, accver, expected_length)
+    if (identical(state, "ok")) {
+      return(list(status = "ok_cached", file = file, detail = NA_character_))
+    }
+    log_failure(acc, accver, kind, "invalid_cached_file", state)
+    unlink(file)
+  }
+
+  text <- tryCatch(
+    with_retry(
+      rentrez::entrez_fetch(db = "nuccore", id = accver, rettype = spec$rettype, retmode = "text"),
+      paste("EFetch", kind, accver)
+    ),
+    error = function(e) structure(conditionMessage(e), class = "fetch_error")
+  )
+  if (inherits(text, "fetch_error")) {
+    log_failure(acc, accver, kind, "network_or_api_error", text)
+    return(list(status = "network_or_api_error", file = NA_character_, detail = as.character(text)))
+  }
+  if (!nzchar(trimws(text))) {
+    log_failure(acc, accver, kind, "invalid_response", "NCBI lieferte eine leere Antwort")
+    return(list(status = "invalid_response", file = NA_character_, detail = "leere Antwort"))
+  }
+
+  if (identical(kind, "gff3")) {
+    state <- classify_gff3_text(text, accver, expected_length)
+    if (identical(state, "no_annotation")) {
+      log_failure(acc, accver, kind, "not_available", "NCBI liefert für diesen Record keine GFF3-Annotation")
+      return(list(status = "not_available", file = NA_character_,
+                  detail = "NCBI stellt kein annotiertes GFF3 bereit"))
+    }
+    if (!identical(state, "ok")) {
+      log_failure(acc, accver, kind, "invalid_response", state)
+      return(list(status = "invalid_response", file = NA_character_, detail = state))
+    }
+  }
+
+  write_atomic(text, file)
+  state <- spec$validate(file, accver, expected_length)
+  if (!identical(state, "ok")) {
+    log_failure(acc, accver, kind, "validation_failed", state)
+    unlink(file)
+    return(list(status = "validation_failed", file = NA_character_, detail = state))
+  }
+  list(status = "ok_downloaded", file = file, detail = NA_character_)
+}
+
+# Die von NCBI gemeldete Sequenzlänge (ESummary slen) dient als
+# Vollständigkeitsmaßstab für alle drei Dateitypen. Es werden ausschließlich
+# die in run_accessions bestimmten Records angefasst; unveränderte Records
+# werden weder geladen noch inhaltlich geprüft.
+expected_lengths <- if (length(run_accessions)) {
+  vapply(run_accessions, function(a) int_scalar(summaries[[a]]$slen), integer(1))
+} else integer(0)
+
+download_status <- if (length(run_accessions)) {
+  do.call(rbind, lapply(run_accessions, function(accver) {
+    res <- lapply(names(file_spec), function(k) acquire_file(accver, k, expected_lengths[[accver]]))
+    names(res) <- names(file_spec)
+    data.frame(
+      accession_version = accver,
+      fasta = res$fasta$status,
+      genbank = res$genbank$status,
+      gff3 = res$gff3$status,
+      gff3_detail = res$gff3$detail
+    )
+  }))
+} else {
+  data.frame(accession_version = character(0), fasta = character(0),
+             genbank = character(0), gff3 = character(0), gff3_detail = character(0))
+}
+download_status
+```
+
+### Selbsttest der GFF3-Statusklassifikation
+
+Alle drei Testrecords liefern annotiertes NCBI-GFF3, der Zweig "von NCBI nicht bereitgestellt" wird also im Lauf nicht erreicht. Damit die Unterscheidung trotzdem geprüft ist, wird `classify_gff3_text()` hier gegen konstruierte Antwortformen getestet. Es werden keine Annotationen erzeugt und keine Testdaten in den Datensatz übernommen.
+
+```{r}
+gff3_selftest <- data.frame(
+  case = c("annotiertes NCBI-GFF3", "NCBI-GFF3 ohne Features",
+           "EFetch-Fehlertext mit HTTP 200", "falsche Accession", "unvollständige Sequenzregion"),
+  expected = c("ok", "no_annotation", "invalid_response", "accession_mismatch", "length_mismatch"),
+  observed = c(
+    classify_gff3_text(paste0("##gff-version 3\n##sequence-region AF081810.1 1 161046\n",
+                              "AF081810.1\tGenbank\tregion\t1\t161046\t.\t+\t.\tID=x\n",
+                              "AF081810.1\tGenbank\tCDS\t673\t1410\t.\t+\t0\tID=y\n"),
+                       "AF081810.1", 161046L),
+    classify_gff3_text(paste0("##gff-version 3\n##sequence-region AF081810.1 1 161046\n",
+                              "AF081810.1\tGenbank\tregion\t1\t161046\t.\t+\t.\tID=x\n"),
+                       "AF081810.1", 161046L),
+    classify_gff3_text("Error: F a i l e d  t o  u n d e r s t a n d  i d", "AF081810.1", 161046L),
+    classify_gff3_text(paste0("##gff-version 3\n##sequence-region AF999999.1 1 161046\n",
+                              "AF999999.1\tGenbank\tCDS\t1\t99\t.\t+\t0\tID=y\n"),
+                       "AF081810.1", 161046L),
+    classify_gff3_text(paste0("##gff-version 3\n##sequence-region AF081810.1 1 5000\n",
+                              "AF081810.1\tGenbank\tCDS\t1\t99\t.\t+\t0\tID=y\n"),
+                       "AF081810.1", 161046L)
+  ),
+  stringsAsFactors = FALSE
+)
+gff3_selftest$passed <- gff3_selftest$expected == gff3_selftest$observed
+stopifnot(all(gff3_selftest$passed))
+gff3_selftest
+```
+
+## GenBank- und Sequenzparser
+
+Die Parser verwenden nur den heruntergeladenen NCBI-Record und führen keine biologische Korrektur durch. Gegenüber der ersten Fassung sind drei Fehler behoben: mehrzeilige Qualifier behielten das schließende Anführungszeichen, mehrzeilige `ACCESSION`-Zeilen mit Sekundär-Accessions wurden nicht erfasst, und fortgesetzte Location-Zeilen konnten Qualifier-Werte verfälschen.
+
+```{r}
+# Liest ein Top-Level-Feld inklusive Fortsetzungszeilen (12 Leerzeichen Einzug).
+gb_field <- function(lines, tag) {
+  i <- grep(paste0("^", tag, "\\b"), lines)
+  if (!length(i)) return(NA_character_)
+  i <- i[1L]
+  val <- trimws(sub(paste0("^", tag), "", lines[i]))
+  j <- i + 1L
+  while (j <= length(lines) && grepl("^ {12}\\S", lines[j])) {
+    val <- paste(val, trimws(lines[j]))
+    j <- j + 1L
+  }
+  if (!nzchar(val)) NA_character_ else val
+}
+
+finish_feature <- function(cur) {
+  vals <- cur$qvals
+  vals <- sub('^"', "", vals)
+  vals <- sub('"$', "", vals)
+  vals <- trimws(vals)
+  nms <- cur$qnames
+  if (anyDuplicated(nms)) {
+    u <- unique(nms)
+    vals <- vapply(u, function(n) paste(vals[nms == n], collapse = "; "), character(1))
+    nms <- u
+  }
+  q <- as.list(vals)
+  names(q) <- nms
+  list(key = cur$key, location = cur$location, qualifiers = q)
+}
+
+parse_features <- function(lines) {
+  fs <- grep("^FEATURES", lines)[1L]
+  os <- grep("^ORIGIN", lines)[1L]
+  if (is.na(fs)) return(list())
+  last <- if (is.na(os)) length(lines) else os - 1L
+  if (last <= fs) return(list())
+  features <- list()
+  current <- NULL
+  for (line in lines[(fs + 1L):last]) {
+    if (grepl("^ {5}\\S", line)) {
+      if (!is.null(current)) features[[length(features) + 1L]] <- finish_feature(current)
+      current <- list(key = trimws(substr(line, 6L, 20L)),
+                      location = trimws(substring(line, 21L)),
+                      qnames = character(0), qvals = character(0))
+    } else if (!is.null(current) && grepl("^ {21}/", line)) {
+      q <- substring(trimws(line), 2L)
+      eq <- regexpr("=", q, fixed = TRUE)
+      if (eq > 0L) {
+        nm <- substr(q, 1L, eq - 1L)
+        val <- substring(q, eq + 1L)
+      } else {
+        nm <- q
+        val <- ""
+      }
+      current$qnames <- c(current$qnames, nm)
+      current$qvals <- c(current$qvals, val)
+    } else if (!is.null(current) && grepl("^ {21}\\S", line)) {
+      if (length(current$qvals)) {
+        n <- length(current$qvals)
+        current$qvals[n] <- paste(current$qvals[n], trimws(line))
+      } else {
+        current$location <- paste0(current$location, trimws(line))
+      }
+    }
+  }
+  if (!is.null(current)) features[[length(features) + 1L]] <- finish_feature(current)
+  features
+}
+
+parse_genbank <- function(file) {
+  lines <- readLines(file, warn = FALSE)
+  locus_line <- grep("^LOCUS", lines, value = TRUE)[1L]
+  locus_tokens <- if (is.na(locus_line)) character(0) else strsplit(trimws(sub("^LOCUS", "", locus_line)), " +")[[1L]]
+  locus_date <- if (!is.na(locus_line) && grepl("[0-9]{2}-[A-Z]{3}-[0-9]{4}\\s*$", locus_line)) {
+    sub("^.*?([0-9]{2}-[A-Z]{3}-[0-9]{4})\\s*$", "\\1", locus_line)
+  } else NA_character_
+  topology <- locus_tokens[locus_tokens %in% c("linear", "circular")]
+  moltype <- if (length(locus_tokens) >= 4L) locus_tokens[4L] else NA_character_
+
+  accession_field <- gb_field(lines, "ACCESSION")
+  acc_tokens <- if (is.na(accession_field)) character(0) else strsplit(accession_field, " +")[[1L]]
+  version_field <- gb_field(lines, "VERSION")
+  version <- if (is.na(version_field)) NA_character_ else strsplit(version_field, " +")[[1L]][1L]
+
+  submitted <- grep("JOURNAL\\s+Submitted \\(", lines, value = TRUE)
+  submitted_dates <- sub("^.*Submitted \\(([0-9]{2}-[A-Z]{3}-[0-9]{4})\\).*$", "\\1", submitted)
+  submitted_dates <- submitted_dates[grepl("^[0-9]{2}-[A-Z]{3}-[0-9]{4}$", submitted_dates)]
+  submitted_iso <- sort(unique(vapply(submitted_dates, gb_date_to_iso, character(1), USE.NAMES = FALSE)))
+  submitted_iso <- submitted_iso[!is.na(submitted_iso)]
+
+  list(
+    locus_line = locus_line,
+    locus_date = gb_date_to_iso(locus_date),
+    locus_topology = if (length(topology)) topology[1L] else NA_character_,
+    locus_moltype = moltype,
+    locus_length = if (length(locus_tokens) >= 2L) suppressWarnings(as.integer(locus_tokens[2L])) else NA_integer_,
+    definition = sub("\\.$", "", gb_field(lines, "DEFINITION")),
+    accession = if (length(acc_tokens)) acc_tokens[1L] else NA_character_,
+    secondary_accessions = if (length(acc_tokens) > 1L) paste(acc_tokens[-1L], collapse = ";") else NA_character_,
+    version = version,
+    first_submission_date = if (length(submitted_iso)) submitted_iso[1L] else NA_character_,
+    n_submission_records = length(submitted_iso),
+    features = parse_features(lines)
+  )
+}
+
+qualifier <- function(feature, name) {
+  if (is.null(feature)) return(NA_character_)
+  scalar(feature$qualifiers[[name]])
+}
+
+# Erster nicht-leerer Qualifier aus einer Liste alternativer Namen
+# (z. B. /geo_loc_name ersetzt in neueren Records /country).
+qualifier_any <- function(feature, names_) {
+  for (n in names_) {
+    v <- qualifier(feature, n)
+    if (!is.na(v)) return(v)
+  }
+  NA_character_
+}
+
+source_feature <- function(record) {
+  hits <- Filter(function(x) identical(x$key, "source"), record$features)
+  if (length(hits)) hits[[1L]] else NULL
+}
+
+fasta_sequence <- function(file) {
+  lines <- readLines(file, warn = FALSE)
+  paste(lines[!startsWith(lines, ">")], collapse = "")
+}
+
+# Mehrdeutige Basen sind alle IUPAC-Codes außer A/C/G/T, nicht nur N.
+sequence_stats <- function(sequence) {
+  s <- toupper(gsub("[^A-Za-z]", "", sequence))
+  n <- nchar(s)
+  if (!n) {
+    return(list(length = 0L, gc = NA_real_, ambiguous = NA_integer_,
+                ambiguous_codes = NA_character_, unambiguous = 0L))
+  }
+  counts <- table(strsplit(s, "", fixed = TRUE)[[1L]])
+  cnt <- function(k) sum(counts[names(counts) %in% k])
+  unambiguous <- cnt(c("A", "C", "G", "T"))
+  amb_codes <- setdiff(names(counts), c("A", "C", "G", "T"))
+  list(
+    length = n,
+    gc = if (unambiguous > 0L) 100 * cnt(c("G", "C")) / unambiguous else NA_real_,
+    ambiguous = as.integer(n - unambiguous),
+    ambiguous_codes = if (length(amb_codes)) paste(sort(amb_codes), collapse = "") else NA_character_,
+    unambiguous = as.integer(unambiguous)
+  )
+}
+```
+
+`gc_content_pct` wird als Anteil von G+C an den eindeutigen Basen A+C+G+T berechnet; mehrdeutige Positionen werden dadurch nicht als AT gewertet. Ihre Anzahl steht getrennt in `n_ambiguous_bases`.
+
+## NCBI-Taxonomie
+
+Taxonomie wird ausschließlich aus NCBI-Taxonomy-XML bezogen. Die erste Fassung verwendete `xpathSApply()` mit einer Funktion, die eine zweielementige Liste zurückgibt; `sapply` vereinfacht das zu einer Matrix, wodurch der anschließende `$`-Zugriff mit `$ operator is invalid for atomic vectors` fehlschlug und die gesamte Metadatenzeile verworfen wurde. Hier wird `getNodeSet()` verwendet.
+
+Der Rang des Record-Taxons ist nicht zwangsläufig `species`: Für `AF081810.1` ist TaxID 10449 (*Lymantria dispar multiple nucleopolyhedrovirus*) als `no rank` geführt, während der Species-Rang in der Lineage als *Alphabaculovirus lydisparis* steht. Das Feld heißt deshalb bewusst `ncbi_species` und ist keine ICTV-Harmonisierung.
+
+```{r}
+taxonomy_cache <- new.env(parent = emptyenv())
+
+taxonomy_info <- function(taxid) {
+  out <- list(taxid = NA_character_, rank = NA_character_, scientific_name = NA_character_,
+              lineage = NA_character_, family = NA_character_, genus = NA_character_,
+              ncbi_species = NA_character_, ncbi_species_taxid = NA_character_)
+  if (is.na(taxid) || !nzchar(taxid)) return(out)
+  if (!is.null(taxonomy_cache[[taxid]])) return(taxonomy_cache[[taxid]])
+
+  xml_text <- with_retry(
+    rentrez::entrez_fetch(db = "taxonomy", id = taxid, rettype = "xml", retmode = "text"),
+    paste("ETaxonomy", taxid)
+  )
+  doc <- XML::xmlParse(xml_text, asText = TRUE)
+  on.exit(XML::free(doc), add = TRUE)
+
+  node_value <- function(node, tag) {
+    hits <- XML::getNodeSet(node, paste0("./", tag))
+    if (length(hits)) XML::xmlValue(hits[[1L]]) else NA_character_
+  }
+
+  top_nodes <- XML::getNodeSet(doc, "/TaxaSet/Taxon")
+  if (!length(top_nodes)) return(out)
+  top <- top_nodes[[1L]]
+  out$taxid <- node_value(top, "TaxId")
+  out$rank <- node_value(top, "Rank")
+  out$scientific_name <- node_value(top, "ScientificName")
+  out$lineage <- node_value(top, "Lineage")
+
+  lex <- XML::getNodeSet(doc, "/TaxaSet/Taxon/LineageEx/Taxon")
+  lex_rank <- vapply(lex, node_value, character(1), tag = "Rank")
+  lex_name <- vapply(lex, node_value, character(1), tag = "ScientificName")
+  lex_id <- vapply(lex, node_value, character(1), tag = "TaxId")
+  pick <- function(r) {
+    i <- which(lex_rank == r)
+    if (length(i)) lex_name[i[1L]] else NA_character_
+  }
+  out$family <- pick("family")
+  out$genus <- pick("genus")
+  if (identical(out$rank, "species")) {
+    out$ncbi_species <- out$scientific_name
+    out$ncbi_species_taxid <- out$taxid
+  } else {
+    i <- which(lex_rank == "species")
+    if (length(i)) {
+      out$ncbi_species <- lex_name[i[1L]]
+      out$ncbi_species_taxid <- lex_id[i[1L]]
+    }
+  }
+  taxonomy_cache[[taxid]] <- out
+  out
+}
+```
+
+## GenBank/RefSeq-Beziehung
+
+NCBI stellt die Beziehung zwischen GenBank- und RefSeq-Record explizit über ELink bereit (`linkname = "nuccore_nuccore_gbrs"`). Es wird ausschließlich diese von NCBI gelieferte Verknüpfung gespeichert; keine Ableitung über ähnliche Namen oder Genomlängen.
+
+```{r}
+refseq_relation <- function(uid) {
+  if (is.na(uid) || !nzchar(uid)) return(NA_character_)
+  links <- tryCatch(
+    with_retry(
+      rentrez::entrez_link(dbfrom = "nuccore", db = "nuccore", id = uid,
+                           linkname = "nuccore_nuccore_gbrs"),
+      paste("ELink gbrs", uid)
+    ),
+    error = function(e) NULL
+  )
+  ids <- if (is.null(links)) NULL else links$links$nuccore_nuccore_gbrs
+  if (is.null(ids) || !length(ids)) return(NA_character_)
+  su <- tryCatch(
+    as_summary_list(with_retry(rentrez::entrez_summary(db = "nuccore", id = ids),
+                               paste("ESummary gbrs", uid))),
+    error = function(e) NULL
+  )
+  if (is.null(su)) return(NA_character_)
+  paste(vapply(su, function(z) scalar(z$accessionversion), character(1)), collapse = ";")
+}
+```
+
+## Metadatentabelle
+
+```{r}
+make_metadata_row <- function(accver, summary, record, stats, taxonomy, gff3_status, refseq) {
+  src <- source_feature(record)
+  acc <- base_accession(accver)
+  source_db <- scalar(summary$sourcedb)
+  status <- if (identical(source_db, "refseq") || grepl("^N[CGTWZ]_", accver)) "RefSeq" else
+    if (identical(source_db, "insd")) "GenBank" else source_db
+  ncbi_len <- int_scalar(summary$slen)
+
+  row <- list(
+    accession = acc,
+    accession_version = accver,
+    secondary_accessions = record$secondary_accessions,
+    organism = qualifier(src, "organism"),
+    ncbi_taxid = scalar(summary$taxid),
+    ncbi_taxon_name = taxonomy$scientific_name,
+    ncbi_taxon_rank = taxonomy$rank,
+    ncbi_species = taxonomy$ncbi_species,
+    ncbi_species_taxid = taxonomy$ncbi_species_taxid,
+    genus = taxonomy$genus,
+    family = taxonomy$family,
+    full_taxonomy = taxonomy$lineage,
+    definition = record$definition,
+    sourcedb = source_db,
+    sequence_status = status,
+    molecule_type = qualifier(src, "mol_type"),
+    topology = scalar(summary$topology),
+    genome_length_bp = stats$length,
+    ncbi_slen = ncbi_len,
+    length_matches_ncbi = if (is.na(ncbi_len)) NA else identical(as.integer(stats$length), ncbi_len),
+    gc_content_pct = if (is.na(stats$gc)) NA_real_ else round(stats$gc, 4),
+    n_ambiguous_bases = stats$ambiguous,
+    ambiguous_base_codes = stats$ambiguous_codes,
+    host = qualifier(src, "host"),
+    strain = qualifier(src, "strain"),
+    isolate = qualifier(src, "isolate"),
+    geo_loc_name = qualifier_any(src, c("geo_loc_name", "country")),
+    collection_date = qualifier(src, "collection_date"),
+    ncbi_create_date = esummary_date_to_iso(summary$createdate),
+    ncbi_update_date = esummary_date_to_iso(summary$updatedate),
+    genbank_locus_date = record$locus_date,
+    first_submission_date = record$first_submission_date,
+    public_release_date = NA_character_,
+    refseq_relation = refseq,
+    refseq_relation_source = if (is.na(refseq)) NA_character_ else "NCBI ELink nuccore_nuccore_gbrs",
+    gff3_status = gff3_status
+  )
+  bad <- names(row)[lengths(row) != 1L]
+  if (length(bad)) stop("Nicht-skalare Metadatenfelder: ", paste(bad, collapse = ", "))
+  as.data.frame(row, stringsAsFactors = FALSE)
+}
+
+metadata_rows <- list()
+for (accver in run_accessions) {
+  acc <- base_accession(accver)
+  gb_file <- file.path(paths$genbank, paste0(acc, ".gbff"))
+  fa_file <- file.path(paths$fasta, paste0(acc, ".fasta"))
+  st <- download_status[download_status$accession_version == accver, , drop = FALSE]
+  gff3_status <- if (nrow(st)) st$gff3[1L] else NA_character_
+
+  if (!file.exists(gb_file) || !file.exists(fa_file)) {
+    log_failure(acc, accver, "metadata", "missing_input_file",
+                "FASTA oder GenBank-Datei fehlt; Record wird protokolliert, nicht stillschweigend verworfen")
+    next
+  }
+  one <- tryCatch({
+    record <- parse_genbank(gb_file)
+    stats <- sequence_stats(fasta_sequence(fa_file))
+    summary <- summaries[[accver]]
+    if (is.null(summary)) stop("Kein ESummary-Objekt für ", accver)
+    tax <- taxonomy_info(scalar(summary$taxid))
+    rs <- refseq_relation(scalar(summary$uid))
+    make_metadata_row(accver, summary, record, stats, tax, gff3_status, rs)
+  }, error = function(e) {
+    log_failure(acc, accver, "metadata", "parsing_error", conditionMessage(e))
+    NULL
+  })
+  if (!is.null(one)) metadata_rows[[length(metadata_rows) + 1L]] <- one
+}
+
+new_metadata <- if (length(metadata_rows)) do.call(rbind, metadata_rows) else NULL
+if (!is.null(new_metadata) && !identical(colnames(new_metadata), names(METADATA_SCHEMA))) {
+  stop("Neue Metadatenzeilen entsprechen nicht dem erwarteten Spaltenschema.")
+}
+
+# Nicht verarbeitete Zeilen werden unverändert übernommen. Die bestehende
+# Zeilenreihenfolge bleibt erhalten, neue Records werden angehängt; dadurch
+# bleibt der Diff in der Versionskontrolle auf die tatsächliche Änderung
+# beschränkt. Zeilen zu Accessions, die neu verarbeitet wurden (auch bei
+# geänderter Version), werden durch die neue Zeile ersetzt.
+processed_accessions <- base_accession(run_accessions)
+carried <- if (is.null(existing)) NULL else {
+  existing[!(existing$accession %in% processed_accessions), , drop = FALSE]
+}
+
+metadata <- if (is.null(carried) && is.null(new_metadata)) {
+  data.frame()
+} else if (is.null(carried)) {
+  new_metadata
+} else if (is.null(new_metadata)) {
+  carried
+} else {
+  rbind(carried, new_metadata)
+}
+rownames(metadata) <- NULL
+
+if (nrow(metadata)) {
+  if (anyDuplicated(metadata$accession)) {
+    stop("Doppelte Accessions in der Metadatentabelle: ",
+         paste(unique(metadata$accession[duplicated(metadata$accession)]), collapse = ", "))
+  }
+  lost <- setdiff(cls$unchanged, metadata$accession_version)
+  if (length(lost)) {
+    stop("Unveraenderte Records sind verloren gegangen: ", paste(head(lost, 10), collapse = ", "))
+  }
+}
+
+metadata_write_state <- if (nrow(metadata)) {
+  write_tsv_if_changed(metadata, metadata_file)
+} else "keine Daten"
+
+data.frame(
+  rows_total = nrow(metadata),
+  rows_carried_over = if (is.null(carried)) 0L else nrow(carried),
+  rows_newly_built = if (is.null(new_metadata)) 0L else nrow(new_metadata),
+  metadata_file = metadata_write_state
+)
+```
+
+## Datumsfelder und ihre Quellen
+
+Die Datumsangaben werden nicht gleichgesetzt. Für die Testrecords gilt beobachtbar `genbank_locus_date == ncbi_update_date` (z. B. `AF081810.1`: LOCUS `08-MAR-1999`, ESummary `updatedate 1999/03/08`), während `ncbi_create_date` davon abweicht (`1998/11/03`). Die LOCUS-Zeile dokumentiert laut GenBank-Format das Datum der letzten Änderung, nicht die Erstveröffentlichung.
+
+```{r}
+date_sources <- data.frame(
+  field = c("ncbi_create_date", "ncbi_update_date", "genbank_locus_date",
+            "first_submission_date", "collection_date", "public_release_date"),
+  source = c("NCBI ESummary (nuccore), Feld createdate",
+             "NCBI ESummary (nuccore), Feld updatedate",
+             "GenBank-Flatfile, Datum am Ende der LOCUS-Zeile",
+             "GenBank-Flatfile, frühestes REFERENCE/JOURNAL 'Submitted (DD-MMM-YYYY)'",
+             "GenBank-Flatfile, Qualifier /collection_date im source-Feature",
+             "nicht reproduzierbar aus NCBI verfügbar"),
+  meaning = c("Anlage des Records in der NCBI-Datenbank",
+              "letzte Änderung des Records bei NCBI",
+              "Datum der letzten Änderung des Flatfiles; für die Testrecords identisch mit ncbi_update_date",
+              "Datum der Direkteinreichung an INSDC laut Record",
+              "biologisches Sammeldatum der Probe",
+              "immer NA; NCBI exponiert kein separates Freigabedatum. ncbi_create_date ist der naheliegendste Proxy, wird aber nicht stillschweigend damit gleichgesetzt"),
+  stringsAsFactors = FALSE
+)
+write_tsv_if_changed(date_sources, file.path(paths$metadata, "date_field_sources.tsv"))
+date_sources
+```
+
+## Feldklassifikation der Referenztabelle
+
+Die Werte der Referenzdatei `genome_metadata.tsv` werden nicht eingelesen. Nur ihre Spaltennamen werden hier nach reproduzierbarer Herkunft klassifiziert.
+
+```{r}
+field_classification <- data.frame(
+  field = c("accession", "accession_version", "virus_name", "species", "genus",
+            "baculovirus_group", "family", "full_taxonomy", "ncbi_taxid",
+            "publication_date", "ncbi_create_date", "ncbi_update_date",
+            "sequence_status", "topology", "genome_length_bp", "gc_content_pct",
+            "n_ambiguous_bases", "host", "strain", "isolate", "country",
+            "collection_date", "definition", "n_core_genes_found", "core60_complete",
+            "genus_project_header", "genus_source", "genus_corrected_vs_project",
+            "length_matches_ncbi", "refseq_mirror_of"),
+  classification = c(
+    "1 direkt aus NCBI", "1 direkt aus NCBI", "2 aus NCBI-Record extrahierbar",
+    "5 projektspezifisch (ICTV-Harmonisierung, spaetere Projektstufe)",
+    "1 direkt aus NCBI", "4 zusaetzliche biologische Analyse noetig",
+    "1 direkt aus NCBI", "1 direkt aus NCBI", "1 direkt aus NCBI",
+    "4 nicht reproduzierbar aus NCBI", "1 direkt aus NCBI", "1 direkt aus NCBI",
+    "1 direkt aus NCBI", "1 direkt aus NCBI", "3 aus NCBI-Sequenz berechenbar",
+    "3 aus NCBI-Sequenz berechenbar", "3 aus NCBI-Sequenz berechenbar",
+    "2 aus NCBI-Record extrahierbar", "2 aus NCBI-Record extrahierbar",
+    "2 aus NCBI-Record extrahierbar", "2 aus NCBI-Record extrahierbar",
+    "2 aus NCBI-Record extrahierbar", "2 aus NCBI-Record extrahierbar",
+    "4 zusaetzliche bioinformatische Analyse noetig",
+    "4 zusaetzliche bioinformatische Analyse noetig",
+    "5 projektspezifisch", "5 projektspezifisch (Herkunftsdokumentation)",
+    "5 projektspezifisch", "3 Berechnung plus Vergleich mit NCBI",
+    "1 direkt aus NCBI (ELink nuccore_nuccore_gbrs)"),
+  in_current_output = c(
+    "ja", "ja", "ja (als organism)", "nein (bewusst ausgelassen)", "ja", "nein", "ja", "ja", "ja",
+    "nein (siehe public_release_date = NA)", "ja", "ja", "ja", "ja", "ja", "ja", "ja", "ja", "ja",
+    "ja", "ja (als geo_loc_name)", "ja", "ja", "nein", "nein", "nein", "nein (siehe refseq_relation_source)",
+    "nein", "ja", "ja (als refseq_relation)"),
+  stringsAsFactors = FALSE
+)
+write_tsv_if_changed(field_classification,
+                     file.path(paths$metadata, "metadata_field_classification.tsv"))
+field_classification
+```
+
+Felder der Kategorien 4 und 5 bleiben bewusst aus der Metadatentabelle ausgeschlossen, statt sie als durchgängig leere Spalten mitzuführen. Die ICTV-Species-Harmonisierung ist nicht Teil dieses Workflows.
+
+## Provenienz
+
+```{r}
+search_metadata <- list(
+  database = "nuccore",
+  query = query,
+  query_translation = scalar(search$QueryTranslation),
+  retrieved_at_utc = search_time,
+  search_hits = search_count,
+  current_accession_versions = current_accver,
+  n_current = length(current_accver),
+  duplicate_accessions = duplicate_accessions,
+  resume = list(
+    unchanged = length(cls$unchanged),
+    new_accessions = length(cls$new),
+    changed_accession_version = length(cls$updated),
+    incomplete_reprocess = length(cls$incomplete),
+    not_in_current_search = length(cls$retired),
+    processed_this_run = length(run_accessions)
+  ),
+  processed_accession_versions = run_accessions,
+  metadata_rows_total = nrow(metadata),
+  metadata_file_state = metadata_write_state,
+  restrict_processing = restrict_processing,
+  recheck_unavailable_gff3 = recheck_unavailable_gff3,
+  force_reprocess_all = force_reprocess_all,
+  interfaces = c("NCBI ESearch", "NCBI History/WebEnv",
+                 "NCBI EFetch (rettype=acc, Bestandsaufnahme)", "NCBI ESummary",
+                 "NCBI EFetch (fasta, gb, gff3)", "NCBI ELink (nuccore_nuccore_gbrs)",
+                 "NCBI EFetch Taxonomy (xml)"),
+  gff3_method = paste(
+    "NCBI E-utilities EFetch, db=nuccore, rettype=gff3, retmode=text;",
+    "ausgeliefert von '#!processor NCBI annotwriter'.",
+    "Keine lokale Konversion aus GenBank, keine externe Annotationsquelle."
+  ),
+  refseq_relation_method = "NCBI ELink dbfrom=nuccore db=nuccore linkname=nuccore_nuccore_gbrs",
+  gc_definition = "100 * (G + C) / (A + C + G + T); mehrdeutige Basen ausgeschlossen",
+  batch_size = batch_size,
+  rentrez_version = as.character(packageVersion("rentrez")),
+  jsonlite_version = as.character(packageVersion("jsonlite")),
+  XML_version = as.character(packageVersion("XML")),
+  R_version = R.version.string,
+  entrez_key_used = TRUE
+)
+write_json(search_metadata, file.path(paths$metadata, "ncbi_query_metadata.json"),
+           auto_unbox = TRUE, pretty = TRUE, null = "null")
+str(search_metadata, max.level = 1)
+```
+
+Die Provenienzdatei enthält keinen API-Key; `entrez_key_used` dokumentiert nur, dass ein Key aus der Umgebung verwendet wurde.
+
+## Qualitätskontrolle
+
+Die inhaltliche Prüfung (FASTA-, GenBank- und GFF3-Validierung) läuft nur über die in diesem Lauf verarbeiteten Records. Für den übernommenen Bestand wird ausschließlich geprüft, ob die erwarteten Dateien vorhanden sind; die Inhalte wurden beim ursprünglichen Download validiert und werden nicht erneut eingelesen.
+
+```{r}
+qc_per_record <- if (!length(run_accessions)) {
+  data.frame()
+} else do.call(rbind, lapply(run_accessions, function(accver) {
+  acc <- base_accession(accver)
+  fa <- file.path(paths$fasta, paste0(acc, ".fasta"))
+  gb_file <- file.path(paths$genbank, paste0(acc, ".gbff"))
+  gf <- file.path(paths$gff3, paste0(acc, ".gff3"))
+  st <- download_status[download_status$accession_version == accver, , drop = FALSE]
+  md <- if (nrow(metadata)) metadata[metadata$accession_version == accver, , drop = FALSE] else metadata
+
+  size_of <- function(f) if (file.exists(f)) as.integer(file.info(f)$size) else NA_integer_
+  exp_len <- expected_lengths[[accver]]
+  data.frame(
+    accession_version = accver,
+    fasta_present = file.exists(fa),
+    fasta_valid = if (file.exists(fa)) identical(validate_fasta(fa, accver, exp_len), "ok") else FALSE,
+    fasta_bytes = size_of(fa),
+    fasta_seq_length = if (file.exists(fa)) sequence_stats(fasta_sequence(fa))$length else NA_integer_,
+    genbank_present = file.exists(gb_file),
+    genbank_valid = if (file.exists(gb_file)) identical(validate_genbank(gb_file, accver, exp_len), "ok") else FALSE,
+    genbank_accession_ok = if (file.exists(gb_file)) {
+      !validate_genbank(gb_file, accver, exp_len) %in% c("accession_mismatch", "version_mismatch", "missing_accession", "missing_version")
+    } else FALSE,
+    genbank_bytes = size_of(gb_file),
+    gff3_present = file.exists(gf),
+    gff3_valid = if (file.exists(gf)) identical(validate_gff3(gf, accver, exp_len), "ok") else FALSE,
+    gff3_status = if (nrow(st)) st$gff3[1L] else NA_character_,
+    gff3_bytes = size_of(gf),
+    metadata_row = nrow(md) == 1L,
+    taxid_present = if (nrow(md) == 1L) !is.na(md$ncbi_taxid) else NA,
+    taxonomy_present = if (nrow(md) == 1L) !is.na(md$full_taxonomy) else NA,
+    length_matches_ncbi = if (nrow(md) == 1L) md$length_matches_ncbi else NA
+  )
+}))
+qc_per_record
+```
+
+```{r}
+in_table <- if (nrow(metadata)) metadata$accession_version else character(0)
+expected_gff3 <- if (nrow(metadata)) {
+  metadata$accession[metadata$gff3_status %in% c("ok_downloaded", "ok_cached")]
+} else character(0)
+
+qc_run <- data.frame(
+  search_hits_full_query = search_count,
+  metadata_rows = nrow(metadata),
+  processed_this_run = length(run_accessions),
+  carried_over = if (is.null(carried)) 0L else nrow(carried),
+  # Jeder aktuelle NCBI-Record ist in der Tabelle vertreten
+  all_current_records_in_table = all(current_accver %in% in_table),
+  current_records_missing = sum(!(current_accver %in% in_table)),
+  # Keine Accession doppelt
+  no_duplicate_accessions = if (nrow(metadata)) !anyDuplicated(metadata$accession) else TRUE,
+  # Jede Tabellenzeile hat die erwarteten lokalen Dateien
+  missing_fasta = if (nrow(metadata)) sum(!file.exists(file.path(paths$fasta, paste0(metadata$accession, ".fasta")))) else 0L,
+  missing_genbank = if (nrow(metadata)) sum(!file.exists(file.path(paths$genbank, paste0(metadata$accession, ".gbff")))) else 0L,
+  missing_expected_gff3 = sum(!file.exists(file.path(paths$gff3, paste0(expected_gff3, ".gff3")))),
+  gff3_not_available = if (nrow(metadata)) sum(metadata$gff3_status %in% "not_available") else 0L,
+  fasta_files_on_disk = length(list.files(paths$fasta, pattern = "\\.fasta$")),
+  genbank_files_on_disk = length(list.files(paths$genbank, pattern = "\\.gbff$")),
+  gff3_files_on_disk = length(list.files(paths$gff3, pattern = "\\.gff3$")),
+  all_lengths_match_ncbi = if (nrow(metadata)) all(metadata$length_matches_ncbi %in% TRUE) else NA
+)
+t(qc_run)
+```
+
+```{r}
+if (nrow(metadata)) {
+  missing_by_column <- vapply(metadata, function(col) sum(is.na(col) | col %in% ""), integer(1))
+  print(missing_by_column[missing_by_column > 0L])
+  cat("\nFehlende Pflichtfelder:",
+      if (all(!is.na(metadata$ncbi_taxid)) && all(!is.na(metadata$full_taxonomy))) "keine" else "siehe oben", "\n")
+}
+
+failures <- if (file.exists(failed_file)) read.delim(failed_file, stringsAsFactors = FALSE) else data.frame()
+if (nrow(failures)) {
+  cat("\nProtokollierte Fehler in diesem und früheren Läufen:\n")
+  print(table(failures$step, failures$error_type))
+} else {
+  cat("\nKeine protokollierten Fehler.\n")
+}
+```
+
+Problematische Records werden nicht entfernt. `AF169823.1` führt in der `ACCESSION`-Zeile acht Sekundär-Accessions (zusammengeführte Einreichungen); diese stehen in `secondary_accessions` und werden nicht als Duplikate verworfen. GFF3-Dateien fehlen nur dann, wenn NCBI keine Annotation liefert (`gff3_status = not_available`) oder ein technischer Fehler protokolliert wurde; sie werden nicht durch eine selbst erzeugte Annotation ersetzt.
