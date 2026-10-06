@@ -42,6 +42,14 @@ paths <- list(
 )
 invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
 
+# Manuell kuratierte vollständige Genome, die die Standardquery nicht erfasst:
+# AF162221.1 verwendet im NCBI-Titel "complete sequence" statt "complete genome".
+# AF270937.1 ist ein manuell kuratierter vollständiger Baculovirus-Genomrecord.
+manual_accessions <- c(
+  "AF270937.1",
+  "AF162221.1"
+)
+
 # .Renviron wird von R beim Start im Projektverzeichnis gelesen. Falls der
 # Workflow aus einer Session ohne geladenes .Renviron gerendert wird, wird die
 # Datei hier nachgeladen. Der Key wird dabei zu keinem Zeitpunkt ausgegeben.
@@ -162,7 +170,7 @@ write_atomic <- function(text, file) {
 
 Der Workflow ist inkrementell. Jeder Lauf führt die vollständige NCBI-Suche aus, vergleicht das Ergebnis mit der vorhandenen Metadatentabelle und verarbeitet nur Records, die neu sind, deren `accession_version` sich geändert hat oder deren Daten nachweislich fehlen. Unveränderte Records werden unverändert aus der bestehenden Tabelle übernommen; für sie erfolgt keine ESummary-, Taxonomy-, ELink- oder EFetch-Abfrage und keine erneute Inhaltsprüfung der lokalen Dateien.
 
-`test_accessions` beschränkt ausschließlich, welche Records *verarbeitet* werden. Die Bestandsaufnahme läuft immer über das vollständige Suchergebnis, damit unveränderte Records nicht versehentlich als entfallen gelten.
+`test_accessions` beschränkt ausschließlich, welche Records *verarbeitet* werden. Die Bestandsaufnahme läuft immer über das vollständige Suchergebnis und die manuell kuratierten Accessions, damit unveränderte Records nicht versehentlich als entfallen gelten.
 
 ```{r}
 test_accessions <- character(0)
@@ -191,7 +199,7 @@ data.frame(
 
 ## NCBI-Suche und Bestandsaufnahme
 
-Die Abfrage `Baculoviridae[Organism] AND complete genome[Title]` bleibt unverändert. ESearch liefert Trefferzahl und History. Die aktuellen `accession.version`-Werte werden anschließend über EFetch mit `rettype="acc"` abgerufen: das sind für rund 630 Records etwa 7 kB in zwei Batches. Ein vollständiger ESummary-Abruf über alle Treffer wäre um ein Vielfaches teurer und wird deshalb erst für die tatsächlich zu verarbeitenden Records ausgeführt.
+Die Abfrage `Baculoviridae[Organism] AND complete genome[Title]` bleibt unverändert. Zusätzliche, manuell kuratierte vollständige Genome können über `manual_accessions` ergänzt werden. ESearch liefert Trefferzahl und History. Die aktuellen `accession.version`-Werte werden anschließend über EFetch mit `rettype="acc"` abgerufen: das sind für rund 630 Records etwa 7 kB in zwei Batches. Ein vollständiger ESummary-Abruf über alle Treffer wäre um ein Vielfaches teurer und wird deshalb erst für die tatsächlich zu verarbeitenden Records ausgeführt.
 
 ```{r}
 query <- "Baculoviridae[Organism] AND complete genome[Title]"
@@ -228,6 +236,11 @@ if (anyDuplicated(current_accver)) {
                   sum(duplicated(current_accver))))
   current_accver <- unique(current_accver)
 }
+if (length(manual_accessions) && !all(grepl("\\.[0-9]+$", manual_accessions))) {
+  stop("Manuelle Accessions muessen Versionsnummern enthalten.")
+}
+manually_added <- setdiff(manual_accessions, current_accver)
+current_accver <- unique(c(current_accver, manual_accessions))
 current_accession <- base_accession(current_accver)
 duplicate_accessions <- unique(current_accession[duplicated(current_accession)])
 if (length(duplicate_accessions)) {
@@ -237,6 +250,7 @@ if (length(duplicate_accessions)) {
 
 data.frame(
   search_hits = search_count,
+  manually_added = length(manually_added),
   inventory_accession_versions = length(current_accver),
   duplicate_accessions = length(duplicate_accessions),
   retrieved_at_utc = search_time
@@ -344,7 +358,7 @@ if (restrict_processing) {
 }
 
 # run_accessions muss eindeutig sein und vollständig aus dem aktuellen
-# Suchergebnis stammen. Die Trennung "übernommen vs. neu verarbeitet" erfolgt
+# Inventar stammen. Die Trennung "übernommen vs. neu verarbeitet" erfolgt
 # später über processed_accessions und ist damit überschneidungsfrei.
 stopifnot(!anyDuplicated(run_accessions), all(run_accessions %in% current_accver))
 
@@ -1102,6 +1116,9 @@ search_metadata <- list(
   query_translation = scalar(search$QueryTranslation),
   retrieved_at_utc = search_time,
   search_hits = search_count,
+  manually_added = length(manually_added),
+  inventory_accession_versions = length(current_accver),
+  manual_accessions = manual_accessions,
   current_accession_versions = current_accver,
   n_current = length(current_accver),
   duplicate_accessions = duplicate_accessions,
